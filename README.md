@@ -106,6 +106,8 @@ ccr --version
 3. From any tab: `ccr restore-all`.
 4. Every tab whose UUID is in the registry receives `claude --resume <id>` typed into it. They all spin up in parallel, in their original positions.
 
+Tabs that are not sitting at a shell prompt (for example, a tab still running Claude) are skipped and listed as busy, so a command is never typed into a running program. A tab counts as idle when its foreground process is one of `sh`, `bash`, `zsh`, `fish`, `dash`, `ksh`, `tcsh`, `csh` or `nu` (`SHELL_NAMES` in `bin/ccr`); add yours there if you use another shell. Each dispatched tab is reported as `✓` (sent), `✗` (failed, with Ghostty's error) or `?` (no result, for example after a timeout; check the tab before rerunning).
+
 ## Requirements
 
 | | |

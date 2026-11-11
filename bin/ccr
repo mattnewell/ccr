@@ -62,6 +62,8 @@ CCR_DIR = Path(os.environ.get("CCR_DIR", str(Path.home() / ".ccr")))
 REGISTRY = CCR_DIR / "registry.json"
 LOCKFILE = CCR_DIR / "registry.lock"
 OSASCRIPT_TIMEOUT = 15.0
+# Foreground processes that mean a tab is idle at a prompt and safe to type into.
+SHELL_NAMES = {"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu"}
 
 
 # ─── Registry ──────────────────────────────────────────────────────────────
@@ -172,7 +174,12 @@ def first_user_message(path: Path | None) -> str:
 
 # ─── Ghostty AppleScript ───────────────────────────────────────────────────
 
-def _osascript(script: str, env_extra: dict | None = None, timeout: float = OSASCRIPT_TIMEOUT) -> str:
+def _osascript(
+    script: str,
+    env_extra: dict | None = None,
+    timeout: float = OSASCRIPT_TIMEOUT,
+    report_errors: bool = False,
+) -> str:
     env = os.environ.copy()
     if env_extra:
         env.update(env_extra)
@@ -181,9 +188,17 @@ def _osascript(script: str, env_extra: dict | None = None, timeout: float = OSAS
             ["/usr/bin/osascript", "-e", script],
             capture_output=True, text=True, timeout=timeout, env=env,
         )
-        return out.stdout.strip()
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired:
+        if report_errors:
+            sys.stderr.write(f"ccr: osascript timed out after {timeout:.0f}s\n")
         return ""
+    except OSError as e:
+        if report_errors:
+            sys.stderr.write(f"ccr: could not run osascript: {e}\n")
+        return ""
+    if report_errors and out.returncode != 0:
+        sys.stderr.write(f"ccr: osascript failed: {out.stderr.strip()}\n")
+    return out.stdout.strip()
 
 
 def probe_focused_uuid() -> str | None:
@@ -230,6 +245,54 @@ def list_ghostty_terminals() -> list[tuple[str, str]]:
             uuid, cwd = line.split("\t", 1)
             rows.append((uuid.strip(), cwd.strip()))
     return rows
+
+
+def terminal_foreground_pids() -> dict[str, int]:
+    """Return {uuid: pid} of each Ghostty terminal's foreground process."""
+    out = _osascript('''
+        tell application "Ghostty"
+            set acc to ""
+            repeat with w in windows
+                try
+                    repeat with t in tabs of w
+                        try
+                            repeat with term in terminals of t
+                                try
+                                    set acc to acc & (id of term as text) & "\t" & (pid of term as text) & linefeed
+                                end try
+                            end repeat
+                        end try
+                    end repeat
+                end try
+            end repeat
+            return acc
+        end tell
+    ''', report_errors=True)
+    pids = {}
+    for line in out.splitlines():
+        uuid, _, pid = line.partition("\t")
+        if pid.strip().isdigit():
+            pids[uuid.strip()] = int(pid.strip())
+    return pids
+
+
+def process_names(pids: set[int]) -> dict[int, str]:
+    """Return {pid: executable name} via ps; login-shell '-' prefix stripped."""
+    if not pids:
+        return {}
+    try:
+        out = subprocess.run(
+            ["/bin/ps", "-o", "pid=,comm=", "-p", ",".join(str(p) for p in sorted(pids))],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    names = {}
+    for line in out.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            names[int(parts[0])] = os.path.basename(parts[1].strip()).lstrip("-")
+    return names
 
 
 # ─── Auto-prune (lazy delete on tab close) ─────────────────────────────────
@@ -380,16 +443,20 @@ def cmd_adopt() -> None:
 
 def cmd_restore_all() -> None:
     """Bulk recovery: dispatch `claude --resume <id>` into every restored tab
-    whose UUID is registered, via a SINGLE AppleScript invocation that loops
-    over the targets (avoids 50× osascript spawns)."""
+    whose UUID is registered and that is idle at a shell prompt, via a SINGLE
+    AppleScript invocation that loops over the targets (avoids 50× osascript
+    spawns)."""
     reg = load_registry()
     if not reg:
         sys.stderr.write("ccr: registry is empty, nothing to restore\n")
         return
     live = {u for u, _ in list_ghostty_terminals()}
+    fg_pids = terminal_foreground_pids()
+    fg_names = process_names(set(fg_pids.values()))
     targets = []
     skipped_dead = 0
     skipped_missing = 0
+    skipped_busy: list[tuple[str, str]] = []
     for uuid, entry in reg.items():
         if uuid not in live:
             skipped_dead += 1
@@ -398,20 +465,58 @@ def cmd_restore_all() -> None:
         if not find_session_file(sid):
             skipped_missing += 1
             continue
+        # Only type into tabs sitting at a shell prompt; never into a running program.
+        pid = fg_pids.get(uuid)
+        fg = fg_names.get(pid, "") if pid is not None else ""
+        if fg not in SHELL_NAMES:
+            if pid is None:
+                why = "unknown (Ghostty reported no PID)"
+            elif not fg:
+                why = f"unknown (pid {pid})"
+            else:
+                why = fg
+            skipped_busy.append((uuid, why))
+            continue
         targets.append((uuid, sid, entry.get("cwd", "")))
+
+    def print_skips() -> None:
+        if skipped_dead:
+            print(f"     skipped {skipped_dead} (tab no longer exists)")
+        if skipped_missing:
+            print(f"     skipped {skipped_missing} (session JSONL missing)")
+        if skipped_busy:
+            print(f"     skipped {len(skipped_busy)} (tab busy, not at a shell prompt)")
+            for uuid, fg in skipped_busy:
+                print(f"       – {uuid[:8]}…  running {fg}")
 
     if not targets:
         sys.stderr.write("ccr: no eligible bindings to restore\n")
+        print_skips()
         return
 
     # Build a single AppleScript that loops over targets. Pass UUIDs and
     # session IDs via env-vars (validated as UUIDs) to avoid injection.
+    # Per-target status: OK, ERR (nothing typed) or TYPED (text typed, Enter failed).
     script = '''
+        on flatten(x)
+            -- Keep error text on one line and free of the "|" field separator.
+            set saved to AppleScript's text item delimiters
+            set x to x as text
+            repeat with sep in {linefeed, return, "|"}
+                set AppleScript's text item delimiters to (sep as text)
+                set x to text items of x
+                set AppleScript's text item delimiters to " "
+                set x to x as text
+            end repeat
+            set AppleScript's text item delimiters to saved
+            return x
+        end flatten
+
         on run
             set rawList to (system attribute "CCR_TARGETS")
             set AppleScript's text item delimiters to linefeed
             set targetLines to text items of rawList
-            set ok to 0
+            set results to ""
             tell application "Ghostty"
                 repeat with ln in targetLines
                     if length of ln > 0 then
@@ -419,37 +524,65 @@ def cmd_restore_all() -> None:
                         set parts to text items of ln
                         set u to item 1 of parts
                         set s to item 2 of parts
+                        set outcome to ""
                         try
                             set t to terminal id u
                             input text ("claude --resume " & s) to t
-                            send key "enter" to t
-                            set ok to ok + 1
+                        on error errMsg
+                            set outcome to "ERR|" & (my flatten(errMsg))
                         end try
+                        if outcome is "" then
+                            try
+                                send key "enter" to t
+                                set outcome to "OK"
+                            on error errMsg
+                                set outcome to "TYPED|" & (my flatten(errMsg))
+                            end try
+                        end if
+                        set results to results & u & "|" & outcome & linefeed
                     end if
                 end repeat
             end tell
-            return ok
+            return results
         end run
     '''
     payload = "\n".join(f"{u}|{s}" for u, s, _ in targets)
-    out = _osascript(script, env_extra={"CCR_TARGETS": payload})
+    # Allow extra time per tab so a large restore isn't cut off midway.
+    timeout = OSASCRIPT_TIMEOUT + 0.5 * len(targets)
+    out = _osascript(script, env_extra={"CCR_TARGETS": payload},
+                     timeout=timeout, report_errors=True)
 
-    try:
-        sent = int(out)
-    except ValueError:
-        sent = 0
+    # One "uuid|STATUS[|message]" line per target.
+    results: dict[str, tuple[str, str]] = {}
+    for line in out.splitlines():
+        parts = line.strip().split("|", 2)
+        if len(parts) >= 2:
+            results[parts[0]] = (parts[1], parts[2] if len(parts) == 3 else "")
 
-    for uuid, sid, cwd in targets[:sent]:
-        print(f"  ✓ {uuid[:8]}… → {sid[:8]}…  {cwd}")
+    sent = failed = unknown = 0
+    for uuid, sid, cwd in targets:
+        status, msg = results.get(uuid, ("", ""))
+        label = f"{uuid[:8]}… → {sid[:8]}…"
+        if status == "OK":
+            sent += 1
+            print(f"  ✓ {label}  {cwd}")
+        elif status == "ERR":
+            failed += 1
+            print(f"  ✗ {label}  {msg}")
+        elif status == "TYPED":
+            failed += 1
+            print(f"  ✗ {label}  typed but Enter failed ({msg}); press Enter in that tab")
+        else:
+            # No result: osascript failed or timed out, possibly after sending this one.
+            unknown += 1
+            print(f"  ? {label}  no result from AppleScript; check the tab before rerunning")
     print()
     print(f"ccr: dispatched {sent} resume command(s)")
-    if skipped_dead:
-        print(f"     skipped {skipped_dead} (tab no longer exists)")
-    if skipped_missing:
-        print(f"     skipped {skipped_missing} (session JSONL missing)")
-    failed = len(targets) - sent
-    if failed > 0:
-        print(f"     failed {failed} (AppleScript error during dispatch)")
+    print_skips()
+    if failed:
+        print(f"     failed {failed} (see ✗ lines)")
+    if unknown:
+        print(f"     unknown {unknown} (see ? lines)")
 
 
 def cmd_unbind() -> None:
